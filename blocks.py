@@ -30,6 +30,7 @@ battle turns.
 
 from __future__ import annotations
 
+import heapq
 from typing import TYPE_CHECKING
 
 from sandbox.crane import action, me, tile, units, visible, zone
@@ -182,7 +183,40 @@ def advance(observation: SkirmishObservation, memory: dict, goal: AxialPosition 
     """
     view = _View(observation)
     target = _destination(view, goal)
-    return _best(view, lambda spot: (tile.distance(spot, target),))
+    distances = route_distances(observation, memory, target)
+    return _best(view, lambda spot: (distances.get((spot["q"], spot["r"]), 10000), tile.distance(spot, target)))
+
+
+def route_distances(observation, memory, goal):
+    """Reverse Dijkstra on public terrain only; dynamic occupancy still uses the mask."""
+    key = (goal["q"], goal["r"])
+    maps = memory.setdefault("routes", {})
+    if key in maps:
+        return maps[key]
+    if len(maps) >= 8:
+        maps.clear()
+    grid = observation["observation"]["battlefield"]["tiles"]
+    costs = {}
+    for r, row in enumerate(grid):
+        for q, ground in enumerate(row):
+            if ground["terrain"] not in ("water", "void"):
+                costs[q, r] = (2 if ground["terrain"] == "hill" else 1) + {"forest": 1, "marsh": 2}.get(ground["feature"], 0)
+    if key not in costs:
+        maps[key] = {}
+        return maps[key]
+    distances, queue = {key: 0}, [(0, key)]
+    while queue:
+        distance, here = heapq.heappop(queue)
+        if distance != distances[here]:
+            continue
+        for dq, dr in tile.DIRECTIONS.values():
+            neighbor = here[0] + dq, here[1] + dr
+            candidate = distance + costs[here]
+            if neighbor in costs and candidate < distances.get(neighbor, 100000):
+                distances[neighbor] = candidate
+                heapq.heappush(queue, (candidate, neighbor))
+    maps[key] = distances
+    return distances
 
 
 def hold_ground(
@@ -281,9 +315,11 @@ def capture(
     view = _View(observation)
     center = held["center"]
     inside = {(spot["q"], spot["r"]) for spot in held["tiles"]}
+    distances = route_distances(observation, memory, center)
 
     def score(spot: AxialPosition) -> tuple[int, ...]:
-        return (0 if (spot["q"], spot["r"]) in inside else 1, tile.distance(spot, center))
+        return (0 if (spot["q"], spot["r"]) in inside else 1,
+                distances.get((spot["q"], spot["r"]), 10000), tile.distance(spot, center))
 
     return _best(view, score)
 
@@ -432,7 +468,7 @@ BLOCKS: tuple[Block, ...] = (
 )
 
 
-def assign(observation: SkirmishObservation, memory: dict) -> tuple[Block, AxialPosition | None]:
+def banner_assign(observation: SkirmishObservation, memory: dict) -> tuple[Block, AxialPosition | None]:
     """Return the block and goal this unit plays, chosen once and never reconsidered.
 
     Everything it reads is standing knowledge, fixed for the match: the unit's type, its number
@@ -463,3 +499,56 @@ def assign(observation: SkirmishObservation, memory: dict) -> tuple[Block, Axial
         return kite, heart
     aside = _turn(me.direction(observation), 5 if number % 2 == 0 else 1)
     return (charge if number % 2 == 0 else harass), tile.neighbors(heart)[aside]
+
+
+def assign(observation: SkirmishObservation, memory: dict) -> tuple[Block, AxialPosition | None]:
+    """Zone first, local support second, and cavalry attacks only with visible support.
+
+    Counts are local, never a claim that an unseen zone or army is empty. Re-reading
+    each activation lets a hunter become a capturer after contact disappears.
+    """
+    areas = zone.zones(observation)
+    if not areas:
+        return banner_assign(observation, memory)
+    heart = areas[0]["center"] if areas else tile.at_center(observation)
+    here, kind = me.position(observation), me.unit_type(observation)
+    enemies, allies = visible.enemies(observation), visible.allies(observation)
+    near_enemy = [u for u in enemies if tile.distance(u["position"], heart) <= 5]
+    near_ally = [u for u in allies if tile.distance(u["position"], heart) <= 5]
+    holders = [u for u in allies if zone.at(observation, u["position"]) is not None]
+    if zone.at(observation, here) is not None:
+        holders.append({"unit_id": me.unit_id(observation)})
+
+    if kind == "archer":
+        if enemies and me.hit_points(observation) <= 2 and min(tile.distance(here, u["position"]) for u in enemies) <= 2:
+            return fall_back, heart
+        return kite, heart
+
+    if kind == "footman":
+        # Never give up the only visible friendly presence in a zone to escort.
+        if zone.at(observation, here) is not None and len(holders) == 1:
+            return capture, heart
+        if len(near_enemy) > len(near_ally) + 1 and near_ally:
+            return shield_wall, heart
+        archers = [u for u in allies if u["type"] == "archer" and tile.distance(u["position"], heart) <= 5]
+        if _number(observation) >= 4 and len(holders) >= 2 and archers and enemies:
+            protected = min(archers, key=lambda u: tile.distance(here, u["position"]))
+            threat = min(enemies, key=lambda u: tile.distance(u["position"], protected["position"]))
+            if tile.distance(threat["position"], protected["position"]) <= 3:
+                return screen, protected["position"]
+        return (shield_wall if near_enemy and _number(observation) % 2 else capture), heart
+
+    if me.hit_points(observation) <= 3 and enemies:
+        return fall_back, heart
+    if len(holders) < 2:
+        return capture, heart
+    # Charge only when the landing has support; do not repeat Season 3's solo rush.
+    view = _View(observation)
+    order = charge(observation, memory, heart) if enemies else None
+    if order is not None:
+        landing = tile.at_path_end(here, order["path"])
+        friends = sum(tile.distance(landing, u["position"]) <= 4 for u in allies)
+        threats = len(_threats(view, landing))
+        if friends + 1 >= threats:
+            return charge, heart
+    return hold_ground, heart

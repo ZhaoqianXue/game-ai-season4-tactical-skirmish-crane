@@ -39,9 +39,21 @@ class Agent:
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
         """Run this unit's block, advancing on the activations where it has nothing to say."""
-        if self.block is None:
-            self.block, self.goal = blocks.assign(observation, self.memory)
+        # Reconsider on every activation: private local evidence, not a shared commander.
+        previous = self.block
+        self.block, self.goal = blocks.assign(observation, self.memory)
+        round_number = observation["observation"]["round"]
+        if previous is not self.block:
+            self.memory.setdefault("changes", []).append((round_number, self.block.__name__))
+            if round_number - self.memory.get("last_report", -3) >= 3:
+                self.memory["report"] = f"R{round_number}: {self.block.__name__} near the capture zone."
+                self.memory["last_report"] = round_number
         order = self.block(observation, self.memory, self.goal)
         if order is None:
             return blocks.advance(observation, self.memory, self.goal)
         return order
+
+    def chat(self, inbox):
+        # Reports expose actual role changes in replays; they are not secret coordination.
+        report = self.memory.pop("report", None)
+        return [] if report is None else [{"to": None, "text": report}]

@@ -480,23 +480,27 @@ def test_assign_pins_the_shipped_mapping():
     one test to whatever mapping the rewrite produces; the properties test below it should still
     hold without changes.
     """
-    (block, goal), _ = _assignment("red_footman_0")
+    def starter(unit_id):
+        _, observation = _assignment(unit_id)
+        return blocks.banner_assign(observation, {}), observation
+
+    (block, goal), _ = starter("red_footman_0")
     assert block is blocks.capture
     assert goal == ZONE["center"]
 
-    (block, goal), _ = _assignment("red_footman_1")
+    (block, goal), _ = starter("red_footman_1")
     assert block is blocks.shield_wall
     assert goal == ZONE["center"]
 
-    (block, goal), _ = _assignment("red_archer_0")
+    (block, goal), _ = starter("red_archer_0")
     assert block is blocks.kite
     assert goal == ZONE["center"]
 
-    (block, goal), _ = _assignment("red_cavalry_0")
+    (block, goal), _ = starter("red_cavalry_0")
     assert block is blocks.charge
     assert goal == tile.neighbors(ZONE["center"])[1]
 
-    (block, goal), _ = _assignment("red_cavalry_1")
+    (block, goal), _ = starter("red_cavalry_1")
     assert block is blocks.harass
     assert goal == tile.neighbors(ZONE["center"])[3]
 
